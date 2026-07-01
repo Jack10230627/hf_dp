@@ -1,7 +1,7 @@
 <template>
   <div class="container">
     <!-- 项目2 iframe -->
-    <div :class="['iframe-wrapper', { active: isTransitioned }]">
+    <div :class="['iframe-wrapper', { active: isTransitioned, 'no-anim': !enableTransitionAnimation }]">
       <iframe
         ref="mapIframe"
         src="http://localhost:5174/"
@@ -11,25 +11,35 @@
     </div>
 
     <!-- 项目1 3D -->
-    <div :class="['three-layer', { hidden: isTransitioned, zooming: isTransitioning }]">
+    <div
+      :class="[
+        'three-layer',
+        {
+          hidden: isTransitioned,
+          zooming: isTransitioning && enableTransitionAnimation,
+          'no-anim': !enableTransitionAnimation,
+        },
+      ]"
+    >
       <AnhuiMap ref="threeRef" @zoom-in-limit="switchTo2D" />
     </div>
 
-    <!-- 颜色桥接层：3D 之上，用来把 3D 色调进一步"洗"向 2D 底图 -->
+    <!-- 颜色桥接层：仅在启用动画时显示 -->
     <div
+      v-if="enableTransitionAnimation"
       class="color-bridge"
       :class="{ active: isTransitioning || isTransitioned }"
     ></div>
 
-    <!-- 切换遮罩层 -->
+    <!-- 切换遮罩层：仅在启用动画时显示 -->
     <div
-      v-if="transitionMaskVisible"
+      v-if="transitionMaskVisible && enableTransitionAnimation"
       class="transition-mask"
       :class="{ fadeout: maskFadingOut }"
     >
       <div class="transition-core"></div>
       <div class="transition-ring"></div>
-      <div class="transition-text">正在进入二维地图</div>
+      <div class="transition-text">{{ transitionText }}</div>
     </div>
   </div>
 </template>
@@ -38,10 +48,20 @@
 import { ref, onMounted, onUnmounted } from "vue";
 import AnhuiMap from "./AnhuiMap.vue";
 
+// ==============================================
+// ✨ 过渡动画总开关
+//   true  - 使用完整过渡动画（遮罩、缩放、颜色桥接、发消息延迟）
+//   false - 关闭动画，瞬间切换
+// ==============================================
+const enableTransitionAnimation = ref(true);
+
 const isTransitioned = ref(false);
 const isTransitioning = ref(false);
 const transitionMaskVisible = ref(false);
 const maskFadingOut = ref(false);
+
+// 过渡提示文字（根据方向动态变化）
+const transitionText = ref("正在进入二维地图");
 
 const threeRef = ref(null);
 const mapIframe = ref(null);
@@ -56,6 +76,27 @@ const switchTo2D = (data) => {
 
   isTransitioning.value = true;
   maskFadingOut.value = false;
+  transitionText.value = "正在进入二维地图";
+
+  // ============ 无动画模式：瞬间切换 ============
+  if (!enableTransitionAnimation.value) {
+    if (mapIframe.value?.contentWindow) {
+      mapIframe.value.contentWindow.postMessage(
+        {
+          type: "SYNC_MAP",
+          lonLat: data.lonLat,
+          zoom: data.zoom || 14,
+        },
+        "http://localhost:5174"
+      );
+    }
+    // 直接切到 2D，不等 iframe 回消息
+    isTransitioned.value = true;
+    isTransitioning.value = false;
+    return;
+  }
+
+  // ============ 有动画模式 ============
   transitionMaskVisible.value = true;
 
   // 阶段1：给 3D 场景一点时间做"色调过渡+推近"（约 420ms）
@@ -86,10 +127,16 @@ const switchTo2D = (data) => {
 const finishSwitchTo2D = () => {
   clearTimeout(transitionFallbackTimer);
 
-  // 先让 iframe 显示出来
+  // 无动画模式下：MAP_SYNC_DONE 消息回来时已经切换过了，直接返回
+  if (!enableTransitionAnimation.value) {
+    isTransitioned.value = true;
+    isTransitioning.value = false;
+    return;
+  }
+
+  // 有动画模式：先显示 iframe，再淡出遮罩
   isTransitioned.value = true;
 
-  // 稍等一小段，让 iframe 完成透明度过渡后再淡出遮罩
   setTimeout(() => {
     maskFadingOut.value = true;
     setTimeout(() => {
@@ -108,6 +155,19 @@ const switchTo3D = (lonLat) => {
 
   isTransitioning.value = true;
   maskFadingOut.value = false;
+  transitionText.value = "正在进入三维地图";
+
+  // ============ 无动画模式：瞬间切换 ============
+  if (!enableTransitionAnimation.value) {
+    if (threeRef.value?.syncViewFrom2D) {
+      threeRef.value.syncViewFrom2D(lonLat);
+    }
+    isTransitioned.value = false;
+    isTransitioning.value = false;
+    return;
+  }
+
+  // ============ 有动画模式 ============
   transitionMaskVisible.value = true;
 
   setTimeout(() => {
@@ -162,7 +222,6 @@ onUnmounted(() => {
   position: relative;
   width: 100vw;
   height: 100vh;
-  /* ✨ 容器底色改为浅米绿，避免任何时候露出黑色 */
   background: #eef3ea;
   overflow: hidden;
 }
@@ -182,7 +241,6 @@ onUnmounted(() => {
   will-change: transform, opacity, filter;
 }
 
-/* 过渡进行中：3D 场景做"推近+虚化"效果，模拟俯冲进入 */
 .three-layer.zooming {
   transform: scale(1.35);
   filter: blur(2px) saturate(1.1) brightness(1.03);
@@ -192,6 +250,20 @@ onUnmounted(() => {
   opacity: 0;
   transform: scale(1.6);
   filter: blur(6px) saturate(1.2) brightness(1.05);
+  pointer-events: none;
+}
+
+/* ✨ 无动画模式：禁用所有过渡效果 */
+.three-layer.no-anim {
+  transition: none !important;
+  transform: none !important;
+  filter: none !important;
+}
+
+.three-layer.no-anim.hidden {
+  opacity: 0;
+  transform: none !important;
+  filter: none !important;
   pointer-events: none;
 }
 
@@ -210,7 +282,6 @@ onUnmounted(() => {
     transform 0.9s cubic-bezier(0.25, 0.8, 0.3, 1),
     filter 0.7s ease;
   will-change: transform, opacity, filter;
-  /* 关键：iframe 出现前，容器就是浅绿色，避免闪黑 */
   background: #eef3ea;
 }
 
@@ -220,6 +291,19 @@ onUnmounted(() => {
   transform: scale(1);
   pointer-events: auto;
   filter: blur(0) brightness(1);
+}
+
+/* ✨ 无动画模式：禁用所有过渡效果 */
+.iframe-wrapper.no-anim {
+  transition: none !important;
+  transform: none !important;
+  filter: none !important;
+}
+
+.iframe-wrapper.no-anim.active {
+  opacity: 1;
+  transform: none !important;
+  filter: none !important;
 }
 
 .full-iframe {
@@ -257,7 +341,6 @@ onUnmounted(() => {
   inset: 0;
   z-index: 9999;
   pointer-events: none;
-  /* 从中心透亮渐变到边缘偏浅绿，衔接 2D 底图 */
   background:
     radial-gradient(
       circle at center,
@@ -310,6 +393,7 @@ onUnmounted(() => {
   letter-spacing: 4px;
   text-shadow: 0 0 12px rgba(255, 255, 255, 0.95);
   font-weight: 600;
+  white-space: nowrap;
 }
 
 @keyframes maskIn {
