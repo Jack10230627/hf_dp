@@ -32,6 +32,38 @@
           点击空白处可取消；再次点击其他河流可切换。
         </div>
       </div>
+
+      <div class="camera-info" v-if="isDebug">
+        <div class="camera-info-title">📷 摄像机参数</div>
+        <div class="camera-info-row">
+          <span class="label">目标点:</span>
+          <span class="value">
+            ({{ cameraInfo.targetX.toFixed(0) }},
+            {{ cameraInfo.targetY.toFixed(0) }},
+            {{ cameraInfo.targetZ.toFixed(0) }})
+          </span>
+        </div>
+        <div class="camera-info-row">
+          <span class="label">相对偏移:</span>
+          <span class="value">
+            ({{ cameraInfo.offsetX.toFixed(0) }},
+            {{ cameraInfo.offsetY.toFixed(0) }},
+            {{ cameraInfo.offsetZ.toFixed(0) }})
+          </span>
+        </div>
+        <div class="camera-info-row">
+          <span class="label">距离:</span>
+          <span class="value">{{ cameraInfo.distance.toFixed(0) }}</span>
+        </div>
+        <div class="camera-info-row">
+          <span class="label">方位角:</span>
+          <span class="value">{{ cameraInfo.azimuth.toFixed(1) }}°</span>
+        </div>
+        <div class="camera-info-row">
+          <span class="label">俯仰角:</span>
+          <span class="value">{{ cameraInfo.elevation.toFixed(1) }}°</span>
+        </div>
+      </div>
     </div>
 
     <header class="dashboard-header">
@@ -65,8 +97,21 @@ export default {
   data() {
     return {
       loading: true,
+      isDebug: false,
       selectedRiverName: "",
       currentRegion: "anhui",
+      // ✨ 新增：摄像机信息
+      cameraInfo: {
+        offsetX: 0,
+        offsetY: 0,
+        offsetZ: 0,
+        distance: 0,
+        azimuth: 0, // 水平方位角（度）
+        elevation: 0, // 俯仰角（度）
+        targetX: 0,
+        targetY: 0,
+        targetZ: 0,
+      },
     };
   },
   created() {
@@ -107,7 +152,7 @@ export default {
       all: {
         // 全部视图（包含整个并集）
         target: { x: 0, y: 0, z: 0 }, // 看向地图中心
-        cameraOffset: { x: 0, y: 25000, z: 30000 }, // 摄像机相对目标位置
+        cameraOffset: { x: 0, y: 22562, z: 27075 }, // 摄像机相对目标位置
       },
       anhui: {
         // 安徽中心：约 117.3°E, 31.8°N
@@ -1008,7 +1053,38 @@ export default {
             )[0]
       ).filter((c) => c && !isNaN(c[0]));
     },
+    updateCameraInfo() {
+      const cam = this.camera.position;
+      const tgt = this.controls.target;
 
+      // 相对目标点的偏移
+      const dx = cam.x - tgt.x;
+      const dy = cam.y - tgt.y;
+      const dz = cam.z - tgt.z;
+
+      // 距离
+      const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+      // 水平距离（xz 平面）
+      const horizDist = Math.sqrt(dx * dx + dz * dz);
+
+      // 方位角：绕 Y 轴旋转（0° = 正南方向 +Z，逆时针为正）
+      // atan2(x, z) 返回相对 +Z 轴的角度
+      const azimuth = (Math.atan2(dx, dz) * 180) / Math.PI;
+
+      // 俯仰角：相对水平面向上为正
+      const elevation = (Math.atan2(dy, horizDist) * 180) / Math.PI;
+
+      this.cameraInfo.targetX = tgt.x;
+      this.cameraInfo.targetY = tgt.y;
+      this.cameraInfo.targetZ = tgt.z;
+      this.cameraInfo.offsetX = dx;
+      this.cameraInfo.offsetY = dy;
+      this.cameraInfo.offsetZ = dz;
+      this.cameraInfo.distance = distance;
+      this.cameraInfo.azimuth = azimuth;
+      this.cameraInfo.elevation = elevation;
+    },
     animate() {
       requestAnimationFrame(() => this.animate());
 
@@ -1016,6 +1092,10 @@ export default {
       this.updateCameraAnimation();
 
       this.controls.update();
+
+      // ✨ 新增：更新摄像机信息
+      this.updateCameraInfo();
+
       if (this.borderMat) this.borderMat.uniforms.uTime.value += 0.005;
 
       // ✨ 内层河流流光
@@ -1160,5 +1240,52 @@ export default {
   font-size: 13px;
   opacity: 0.85;
   line-height: 1.4;
+}
+.camera-info {
+  position: absolute;
+  top: 100px;
+  right: 24px;
+  width: 280px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: rgba(0, 24, 40, 0.65);
+  border: 1px solid rgba(0, 221, 255, 0.35);
+  box-shadow: 0 0 24px rgba(0, 221, 255, 0.15);
+  backdrop-filter: blur(6px);
+  color: #bff7ff;
+  z-index: 50;
+  font-family: "Consolas", "Monaco", monospace;
+}
+
+.camera-info-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #00ddff;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(0, 221, 255, 0.2);
+  text-shadow: 0 0 10px rgba(0, 221, 255, 0.4);
+}
+
+.camera-info-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.camera-info-row .label {
+  color: rgba(191, 247, 255, 0.7);
+  flex-shrink: 0;
+  margin-right: 8px;
+}
+
+.camera-info-row .value {
+  color: #ffffff;
+  font-weight: 600;
+  text-align: right;
+  font-family: "Consolas", monospace;
+  text-shadow: 0 0 8px rgba(0, 221, 255, 0.3);
 }
 </style>
