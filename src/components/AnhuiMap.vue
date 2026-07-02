@@ -4,6 +4,28 @@
     <div ref="container" class="map-container">
       <div v-if="loading" class="loading">正在加载安徽水利高清沙盘...</div>
 
+      <!-- ✨ 新增：区域切换按钮 -->
+      <div class="region-switcher">
+        <button
+          :class="{ active: currentRegion === 'all' }"
+          @click="switchRegion('all')"
+        >
+          全部
+        </button>
+        <button
+          :class="{ active: currentRegion === 'anhui' }"
+          @click="switchRegion('anhui')"
+        >
+          安徽
+        </button>
+        <button
+          :class="{ active: currentRegion === 'huaihe' }"
+          @click="switchRegion('huaihe')"
+        >
+          淮河流域
+        </button>
+      </div>
+
       <!-- 河流点击交互信息面板 -->
       <div v-if="selectedRiverName" class="river-info">
         <div class="river-info-title">已选中河流</div>
@@ -37,7 +59,7 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass";
-import { fromUrl } from "geotiff";
+import { fromArrayBuffer } from "geotiff";
 import BottomNav from "./BottomNav.vue";
 import CyberpunkBackground from "./CyberpunkBackground.vue";
 import gsap from "gsap";
@@ -50,9 +72,9 @@ export default {
   data() {
     return {
       loading: true,
-
-      // ===== 河流点击交互状态 =====
       selectedRiverName: "",
+      // ✨ 新增：当前区域
+      currentRegion: "anhui",
     };
   },
   created() {
@@ -66,17 +88,17 @@ export default {
     this.riverMaterials = [];
     this.labelSprites = [];
     this.borderMat = null;
+    this.topMat = null;
     this.lakeMaterial = null;
     this.lakeMaskData = null;
     this.lakeMaskSize = 1024;
 
-    // ===== 河流点击交互新增变量 =====
-    this.riverMeshes = []; // 保存河流 mesh，用于 Raycaster 拾取
-    this.selectedRiverMat = null; // 当前选中河流材质
+    this.riverMeshes = [];
+    this.selectedRiverMat = null;
     this.raycaster = null;
     this.pointer = new THREE.Vector2();
 
-    this._riverBaseColorMap = new Map(); // mesh.uuid -> baseColor(克隆)，用于取消选中恢复
+    this._riverBaseColorMap = new Map();
     this.pointerDown = { x: 0, y: 0 };
     this.pointerMoved = false;
     this._onPointerDown = null;
@@ -94,13 +116,46 @@ export default {
       riverBaseWidth: 8,
       lakeDepth: 150,
     };
+
+    // ✨ 新增：区域配置
+    this.regionConfig = {
+      all: {
+        target: { x: 0, y: 0, z: 0 },
+        cameraOffset: { x: 0, y: 28000, z: 34000 },
+      },
+      anhui: {
+        centerLonLat: [117.3, 31.8],
+        cameraDistance: 20000,
+        cameraHeight: 20000,
+        cameraAngle: 0,
+      },
+      huaihe: {
+        centerLonLat: [116.5, 33.5],
+        cameraDistance: 24000,
+        cameraHeight: 22000,
+        cameraAngle: 0,
+      },
+    };
+
+    // ✨ 新增：摄像机动画状态
+    this.cameraAnim = {
+      active: false,
+      startTime: 0,
+      duration: 1500,
+      fromPos: new THREE.Vector3(),
+      toPos: new THREE.Vector3(),
+      fromTarget: new THREE.Vector3(),
+      toTarget: new THREE.Vector3(),
+    };
+    this.defaultRegion = "anhui";
+
     this.labelConfig = {
       fontSize: 42,
       color: "#0d3a68",
       color2: "#0d3a68",
       strokeColor: "#ffffff",
-      strokeWidth: 6, // 描边加粗，弥补去掉背景后的可读性
-      bgColor: "rgba(255, 255, 255, 0.35)", // 背景大幅降低不透明度，只留淡淡感觉
+      strokeWidth: 6,
+      bgColor: "rgba(255, 255, 255, 0.35)",
       padding: 10,
       scale: 5,
       heightOffset: 200,
@@ -116,6 +171,7 @@ export default {
   },
   beforeDestroy() {
     window.removeEventListener("resize", this.onResize);
+    window.removeEventListener("message", this.handleIframeMessage);
 
     const dom = this.renderer?.domElement;
     if (dom) {
@@ -134,16 +190,12 @@ export default {
 
       this.scene = new THREE.Scene();
 
-      // 1. 调整相机参数：FOV 建议 35，更具大屏感
       this.camera = new THREE.PerspectiveCamera(
         35,
         container.clientWidth / container.clientHeight,
         1,
         1000000,
       );
-
-      // 2. 设置初始位置：Y=高度，Z=偏移量。
-      // Y 和 Z 设为相同（如 28000）可以获得标准的 45 度俯视视角
       this.camera.position.set(0, 28000, 28000);
 
       this.renderer = new THREE.WebGLRenderer({
@@ -159,14 +211,11 @@ export default {
       container.appendChild(this.renderer.domElement);
 
       this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-      // --- 关键设置开始 ---
-      this.controls.enableRotate = false; // 禁止旋转（右键和左键旋转都失效）
-      this.controls.enablePan = true; // 允许平移（可选，建议保留，方便用户查看地图各处）
-      this.controls.enableDamping = true; // 阻尼效果，让缩放更平滑
-
-      // 限制缩放范围，防止用户拉得太远或钻进地里
-      this.controls.minDistance = 4000; // 触发过度到 2D 的临界点
-      this.controls.maxDistance = 60000; // 最大拉伸距离
+      this.controls.enableRotate = false;
+      this.controls.enablePan = true;
+      this.controls.enableDamping = true;
+      this.controls.minDistance = 4000;
+      this.controls.maxDistance = 60000;
 
       this.mapGroup = new THREE.Group();
       this.scene.add(this.mapGroup);
@@ -178,7 +227,6 @@ export default {
 
       this.initSpaceBackground();
 
-      // ===== 河流点击交互：Raycaster 初始化 & 事件绑定 =====
       this.raycaster = new THREE.Raycaster();
 
       this._onPointerDown = (e) => {
@@ -193,7 +241,6 @@ export default {
         if (Math.sqrt(dx * dx + dy * dy) > 6) this.pointerMoved = true;
       };
       this._onPointerUp = (e) => {
-        // 拖拽不算点击，避免与 OrbitControls 冲突
         if (this.pointerMoved) return;
         this.handleRiverClick(e);
       };
@@ -214,7 +261,7 @@ export default {
         new THREE.Vector2(container.clientWidth, container.clientHeight),
         0.5,
         0.6,
-        0.92, // 让浅青色边界和青白河流头都能发光
+        0.92,
       );
       this.composer.addPass(bloom);
 
@@ -251,35 +298,90 @@ export default {
 
     async loadData() {
       try {
-        const [geoRes, tiffRes, riverRes, lakeRes] = await Promise.all([
-          fetch("/anhui_border.geojson").then((res) => res.json()),
-          fromUrl("/anhui_height_float.tif"),
-          fetch("/anhui_river.geojson").then((res) => res.json()),
-          fetch("/anhui_lake.geojson").then((res) => res.json()),
-        ]);
+        // ✨ 换成项目2的数据源（并集 + 安徽 + 淮河 + 并集 DEM + 并集河流）
+        const [anhuiRes, huaiheRes, unionRes, tiffRes, riverRes] =
+          await Promise.all([
+            fetch("/anhui_border.geojson").then((r) => r.json()),
+            fetch("/huaihe_border.geojson").then((r) => r.json()),
+            fetch("/union_border.geojson").then((r) => r.json()),
+            fetch("/union_web.tif")
+              .then((r) => r.arrayBuffer())
+              .then((buf) => fromArrayBuffer(buf)),
+            fetch("/union_river_filtered_byName.geojson").then((r) => r.json()),
+          ]);
 
-        const coords = this.extractCoords(geoRes);
-        this.calculateBounds(coords);
+        this.anhuiGeoJson = anhuiRes;
+        this.huaiheGeoJson = huaiheRes;
+        this.unionGeoJson = unionRes;
 
+        // 用并集算 bounds
+        const unionCoords = this.extractCoords(unionRes);
+        this.calculateBounds(unionCoords);
+
+        // 保持地图纵横比
+        const lonRange = this.bounds.maxLon - this.bounds.minLon;
+        const latRange = this.bounds.maxLat - this.bounds.minLat;
+        const aspect = lonRange / latRange;
+        this.config.width = 20000 * aspect;
+        this.config.height = 20000;
+
+        const scaleRatio = this.config.width / 20000;
+        this.config.borderWidth *= scaleRatio;
+        this.config.riverBaseWidth *= scaleRatio;
+        this.labelConfig.heightOffset *= scaleRatio;
+
+        // 读取 DEM
         const image = await tiffRes.getImage();
-        this.demData = await image.readRasters();
+        const rasters = await image.readRasters();
+        this.demData =
+          Array.isArray(rasters) && rasters[0]?.length ? rasters : [rasters];
         this.demW = image.getWidth();
         this.demH = image.getHeight();
+
+        // DEM 自身的地理范围
+        const demBbox = image.getBoundingBox();
+        this.demBounds = {
+          minLon: demBbox[0],
+          minLat: demBbox[1],
+          maxLon: demBbox[2],
+          maxLat: demBbox[3],
+        };
+
         let demMax = 0;
-        for (let i = 0; i < this.demData[0].length; i++) {
-          const v = this.demData[0][i];
-          if (v < 10000) demMax = Math.max(demMax, v);
+        const arr = this.demData[0];
+        for (let i = 0; i < arr.length; i++) {
+          const v = arr[i];
+          if (!isNaN(v) && v > 0 && v < 10000) {
+            if (v > demMax) demMax = v;
+          }
         }
+        if (demMax === 0) demMax = 1500;
 
-        // this.createLakeMask(lakeRes)
-
-        this.buildMap(coords, demMax);
+        this.buildMap(unionCoords, demMax);
         this.createRivers(riverRes, demMax);
-        // this.createLakes(lakeRes, demMax)
+
         this.loading = false;
+
+        // ✨ 默认切换到安徽（无动画，瞬间到位）
+        this.$nextTick(() => {
+          this.switchRegion(this.defaultRegion, false);
+        });
       } catch (err) {
         console.error("加载失败:", err);
       }
+    },
+
+    // 经纬度转世界坐标
+    lonLatToWorld(lon, lat) {
+      const u =
+        (lon - this.bounds.minLon) / (this.bounds.maxLon - this.bounds.minLon);
+      const v =
+        (lat - this.bounds.minLat) / (this.bounds.maxLat - this.bounds.minLat);
+      return new THREE.Vector3(
+        (u - 0.5) * this.config.width,
+        0,
+        -(v - 0.5) * this.config.height,
+      );
     },
 
     calculateBounds(coords) {
@@ -293,110 +395,24 @@ export default {
       };
     },
 
-    // ✨ 关键修复：边界保持 0（不沉），中心 1（全沉），用内描边挤压
-    createLakeMask(lakeJson) {
-      const size = this.lakeMaskSize;
-      const canvas = document.createElement("canvas");
-      canvas.width = canvas.height = size;
-      const ctx = canvas.getContext("2d");
-
-      // 黑色背景
-      ctx.fillStyle = "black";
-      ctx.fillRect(0, 0, size, size);
-
-      // 1. 湖泊填白
-      ctx.fillStyle = "white";
-      lakeJson.features.forEach((feature) => {
-        const polygons =
-          feature.geometry.type === "Polygon"
-            ? [feature.geometry.coordinates]
-            : feature.geometry.coordinates;
-        polygons.forEach((polygon) => {
-          const ring = polygon[0];
-          if (!ring || ring.length < 3) return;
-          ctx.beginPath();
-          ring.forEach((c, i) => {
-            const u =
-              (c[0] - this.bounds.minLon) /
-              (this.bounds.maxLon - this.bounds.minLon);
-            const v =
-              (c[1] - this.bounds.minLat) /
-              (this.bounds.maxLat - this.bounds.minLat);
-            const x = u * size;
-            const y = (1 - v) * size;
-            if (i === 0) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
-          });
-          ctx.closePath();
-          ctx.fill();
-        });
-      });
-
-      // 2. ✨ 边界画黑色描边，挤压内部白色（让边界=0，不下沉）
-      ctx.strokeStyle = "black";
-      ctx.lineWidth = 6;
-      ctx.lineJoin = "round";
-      lakeJson.features.forEach((feature) => {
-        const polygons =
-          feature.geometry.type === "Polygon"
-            ? [feature.geometry.coordinates]
-            : feature.geometry.coordinates;
-        polygons.forEach((polygon) => {
-          const ring = polygon[0];
-          if (!ring || ring.length < 3) return;
-          ctx.beginPath();
-          ring.forEach((c, i) => {
-            const u =
-              (c[0] - this.bounds.minLon) /
-              (this.bounds.maxLon - this.bounds.minLon);
-            const v =
-              (c[1] - this.bounds.minLat) /
-              (this.bounds.maxLat - this.bounds.minLat);
-            const x = u * size;
-            const y = (1 - v) * size;
-            if (i === 0) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
-          });
-          ctx.closePath();
-          ctx.stroke();
-        });
-      });
-
-      // 3. 轻微模糊让过渡自然
-      ctx.filter = "blur(4px)";
-      ctx.drawImage(canvas, 0, 0);
-      ctx.filter = "none";
-
-      this.lakeMaskData = ctx.getImageData(0, 0, size, size).data;
-    },
-
+    // ✨ 修改：使用 DEM 独立 bounds 采样（因为 DEM 是并集范围，可能和 bounds 不同）
     getH(u, v, demMax) {
-      const cx = u * (this.demW - 1);
-      const cy = (1 - v) * (this.demH - 1);
-      const data = this.demData[0];
-      const getV = (x, y) => {
-        x = Math.max(0, Math.min(this.demW - 1, x));
-        y = Math.max(0, Math.min(this.demH - 1, y));
-        const vv = data[Math.floor(y) * this.demW + Math.floor(x)];
-        return isNaN(vv) || vv < 0 ? 0 : vv;
-      };
-      let h =
-        Math.pow(getV(cx, cy) / demMax, this.config.hExp) * this.config.maxH;
+      const lon =
+        this.bounds.minLon + u * (this.bounds.maxLon - this.bounds.minLon);
+      const lat =
+        this.bounds.minLat + v * (this.bounds.maxLat - this.bounds.minLat);
 
-      // ✨ 应用湖泊凹陷
-      if (this.lakeMaskData) {
-        const lx = Math.floor(u * (this.lakeMaskSize - 1));
-        const ly = Math.floor((1 - v) * (this.lakeMaskSize - 1));
-        const idx = (ly * this.lakeMaskSize + lx) * 4;
-        const mask = this.lakeMaskData[idx] / 255;
-        h -= mask * this.config.lakeDepth;
-      }
-      return h;
-    },
+      const demU =
+        (lon - this.demBounds.minLon) /
+        (this.demBounds.maxLon - this.demBounds.minLon);
+      const demV =
+        (lat - this.demBounds.minLat) /
+        (this.demBounds.maxLat - this.demBounds.minLat);
 
-    getOriginalH(u, v, demMax) {
-      const cx = u * (this.demW - 1);
-      const cy = (1 - v) * (this.demH - 1);
+      if (demU < 0 || demU > 1 || demV < 0 || demV > 1) return 0;
+
+      const cx = demU * (this.demW - 1);
+      const cy = (1 - demV) * (this.demH - 1);
       const data = this.demData[0];
       const getV = (x, y) => {
         x = Math.max(0, Math.min(this.demW - 1, x));
@@ -407,6 +423,10 @@ export default {
       return (
         Math.pow(getV(cx, cy) / demMax, this.config.hExp) * this.config.maxH
       );
+    },
+
+    getOriginalH(u, v, demMax) {
+      return this.getH(u, v, demMax);
     },
 
     buildMap(coords, demMax) {
@@ -424,86 +444,271 @@ export default {
       }
       topGeom.computeVertexNormals();
 
-      const topMat = new THREE.ShaderMaterial({
+      // ✨ 保留项目1的浅色地形风格 + 加区域高亮控制
+      this.topMat = new THREE.ShaderMaterial({
         uniforms: {
-          uMask: { value: this.createMask(coords) },
+          uUnionMask: { value: this.createMaskFromGeoJson(this.unionGeoJson) },
+          uAnhuiMask: { value: this.createMaskFromGeoJson(this.anhuiGeoJson) },
+          uHuaiheMask: {
+            value: this.createMaskFromGeoJson(this.huaiheGeoJson),
+          },
+          uActiveRegion: { value: 0 }, // 0=anhui, 1=huaihe, 2=all
+          uDarkness: { value: 0.35 }, // 非当前区域压暗程度
           uMaxH: { value: this.config.maxH },
         },
-        vertexShader: `varying vec2 vUv; varying float vH; varying vec3 vNormal; void main(){ vUv = uv; vH = position.y; vNormal = normalize(normalMatrix * normal); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+        vertexShader: `
+          varying vec2 vUv;
+          varying float vH;
+          varying vec3 vNormal;
+          void main(){
+            vUv = uv;
+            vH = position.y;
+            vNormal = normalize(normalMatrix * normal);
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
         fragmentShader: `
-  uniform sampler2D uMask;
-  uniform float uMaxH;
-  varying vec2 vUv;
-  varying float vH;
-  varying vec3 vNormal;
-  void main(){
-    // Mask 采样 —— 增加 AO 计算
-    float mask = texture2D(uMask, vUv).r;
-    if(mask < 0.5) discard;
+          uniform sampler2D uUnionMask;
+          uniform sampler2D uAnhuiMask;
+          uniform sampler2D uHuaiheMask;
+          uniform int uActiveRegion;
+          uniform float uDarkness;
+          uniform float uMaxH;
+          varying vec2 vUv;
+          varying float vH;
+          varying vec3 vNormal;
+          void main(){
+            float unionMask = texture2D(uUnionMask, vUv).r;
+            if(unionMask < 0.5) discard;
 
-    // ✨ 边缘 AO：靠近边界的地方，通过采样周围 mask，暗化颜色
-    float ao = 1.0;
-    float aoRadius = 0.004;
-    float aoSum = 0.0;
-    for(int i = 0; i < 8; i++){
-      float angle = float(i) * 0.7854; // 45度间隔
-      vec2 offset = vec2(cos(angle), sin(angle)) * aoRadius;
-      aoSum += texture2D(uMask, vUv + offset).r;
-    }
-    // 8 个采样点全在边界内 = 1.0（无 AO），周围有掉出边界的 = 变暗
-    ao = mix(0.55, 1.0, aoSum / 8.0);
+            // AO 边缘阴影
+            float aoRadius = 0.004;
+            float aoSum = 0.0;
+            for(int i = 0; i < 8; i++){
+              float angle = float(i) * 0.7854;
+              vec2 offset = vec2(cos(angle), sin(angle)) * aoRadius;
+              aoSum += texture2D(uUnionMask, vUv + offset).r;
+            }
+            float ao = mix(0.55, 1.0, aoSum / 8.0);
 
-    float h = clamp(vH / uMaxH, 0.0, 1.0);
-    vec3 c1 = vec3(0.78, 0.84, 0.72);
-    vec3 c2 = vec3(0.60, 0.72, 0.52);
-    vec3 c3 = vec3(0.38, 0.52, 0.32);
-    vec3 color;
-    if(h < 0.25){
-      color = mix(c1, c2, h/0.25);
-    } else {
-      color = mix(c2, c3, (h-0.25)/0.75);
-    }
+            // 项目1的浅色地形渐变
+            float h = clamp(vH / uMaxH, 0.0, 1.0);
+            vec3 c1 = vec3(0.78, 0.84, 0.72);
+            vec3 c2 = vec3(0.60, 0.72, 0.52);
+            vec3 c3 = vec3(0.38, 0.52, 0.32);
+            vec3 color;
+            if(h < 0.25){
+              color = mix(c1, c2, h/0.25);
+            } else {
+              color = mix(c2, c3, (h-0.25)/0.75);
+            }
 
-    float diff = max(dot(vNormal, normalize(vec3(0.5, 1.0, 0.5))), 0.0);
-    vec3 lit = color * (diff * 0.45 + 0.5) * ao;   // ✨ 乘上 AO 系数
+            float diff = max(dot(vNormal, normalize(vec3(0.5, 1.0, 0.5))), 0.0);
+            vec3 lit = color * (diff * 0.45 + 0.5) * ao;
+            lit = min(lit, vec3(0.9));
 
-    gl_FragColor = vec4(min(lit, vec3(0.9)), 1.0);
-  }
-`,
+            // ✨ 区域高亮/压暗
+            float inAnhui  = smoothstep(0.35, 0.65, texture2D(uAnhuiMask, vUv).r);
+            float inHuaihe = smoothstep(0.35, 0.65, texture2D(uHuaiheMask, vUv).r);
+
+            float brightness = 1.0;
+            if (uActiveRegion == 0) {
+              brightness = mix(uDarkness, 1.0, inAnhui);
+            } else if (uActiveRegion == 1) {
+              brightness = mix(uDarkness, 1.0, inHuaihe);
+            }
+
+            gl_FragColor = vec4(lit * brightness, 1.0);
+          }
+        `,
       });
-      this.mapGroup.add(new THREE.Mesh(topGeom, topMat));
+      this.mapGroup.add(new THREE.Mesh(topGeom, this.topMat));
       this.createGoldenBorder(coords, demMax);
       this.createWalls(coords, demMax, this.config.baseY);
     },
 
-    // ========= 河流点击交互：拾取事件处理 =========
-    handleRiverClick(event) {
-      if (!this.raycaster || !this.camera || !this.renderer) return;
-      if (!this.riverMeshes || this.riverMeshes.length === 0) return;
+    // ✨ 新增：从任意 GeoJson 生成 mask
+    createMaskFromGeoJson(geoJson, size = 2048) {
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = size;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, size, size);
+      ctx.fillStyle = "white";
 
-      const rect = this.renderer.domElement.getBoundingClientRect();
-      const x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-      const y = -(((event.clientY - rect.top) / rect.height) * 2 - 1);
+      const drawRing = (ring) => {
+        ctx.beginPath();
+        ring.forEach((c, i) => {
+          const u =
+            (c[0] - this.bounds.minLon) /
+            (this.bounds.maxLon - this.bounds.minLon);
+          const v =
+            (c[1] - this.bounds.minLat) /
+            (this.bounds.maxLat - this.bounds.minLat);
+          const x = u * size;
+          const y = (1 - v) * size;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.closePath();
+        ctx.fill();
+      };
 
-      this.pointer.set(x, y);
-      this.raycaster.setFromCamera(this.pointer, this.camera);
+      geoJson.features.forEach((f) => {
+        const geom = f.geometry;
+        if (geom.type === "Polygon") {
+          drawRing(geom.coordinates[0]);
+        } else if (geom.type === "MultiPolygon") {
+          geom.coordinates.forEach((poly) => drawRing(poly[0]));
+        }
+      });
 
-      const intersects = this.raycaster.intersectObjects(
-        this.riverMeshes,
-        false,
-      );
-      if (!intersects || intersects.length === 0) {
-        this.clearRiverSelection();
-        return;
-      }
-
-      const mesh = intersects[0].object;
-      if (!mesh || !mesh.userData || !mesh.userData.riverName) return;
-      this.selectRiverByMesh(mesh);
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      return tex;
     },
 
+    // ✨ 新增：区域切换
+    switchRegion(name, animate = true) {
+      const map = { anhui: 0, huaihe: 1, all: 2 };
+      this.currentRegion = name;
+      const regionId = map[name];
+
+      // 更新地形高亮
+      if (this.topMat) {
+        this.topMat.uniforms.uActiveRegion.value = regionId;
+      }
+      // 更新河流高亮
+      this.riverMaterials.forEach((mat) => {
+        if (mat.uniforms.uActiveRegion) {
+          mat.uniforms.uActiveRegion.value = regionId;
+        }
+      });
+
+      // 计算摄像机目标
+      const cfg = this.regionConfig[name];
+      let targetPos, cameraPos;
+
+      if (name === "all") {
+        targetPos = new THREE.Vector3(cfg.target.x, cfg.target.y, cfg.target.z);
+        cameraPos = new THREE.Vector3(
+          cfg.cameraOffset.x,
+          cfg.cameraOffset.y,
+          cfg.cameraOffset.z,
+        );
+      } else {
+        targetPos = this.lonLatToWorld(
+          cfg.centerLonLat[0],
+          cfg.centerLonLat[1],
+        );
+        cameraPos = new THREE.Vector3(
+          targetPos.x + Math.sin(cfg.cameraAngle) * cfg.cameraDistance,
+          cfg.cameraHeight,
+          targetPos.z + Math.cos(cfg.cameraAngle) * cfg.cameraDistance,
+        );
+      }
+
+      if (animate) {
+        this.startCameraAnimation(cameraPos, targetPos);
+      } else {
+        this.camera.position.copy(cameraPos);
+        this.controls.target.copy(targetPos);
+        this.controls.update();
+      }
+    },
+
+    startCameraAnimation(toPos, toTarget) {
+      this.cameraAnim.active = true;
+      this.cameraAnim.startTime = performance.now();
+      this.cameraAnim.fromPos.copy(this.camera.position);
+      this.cameraAnim.toPos.copy(toPos);
+      this.cameraAnim.fromTarget.copy(this.controls.target);
+      this.cameraAnim.toTarget.copy(toTarget);
+    },
+
+    updateCameraAnimation() {
+      if (!this.cameraAnim.active) return;
+      const now = performance.now();
+      const elapsed = now - this.cameraAnim.startTime;
+      let t = Math.min(elapsed / this.cameraAnim.duration, 1.0);
+      // easeInOutCubic
+      t = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+      this.camera.position.lerpVectors(
+        this.cameraAnim.fromPos,
+        this.cameraAnim.toPos,
+        t,
+      );
+      this.controls.target.lerpVectors(
+        this.cameraAnim.fromTarget,
+        this.cameraAnim.toTarget,
+        t,
+      );
+      this.controls.update();
+
+      if (elapsed >= this.cameraAnim.duration) {
+        this.cameraAnim.active = false;
+      }
+    },
+
+    // ========= 河流点击交互：拾取事件处理 =========
+ // ========= 河流点击交互：拾取事件处理 =========
+handleRiverClick(event) {
+  if (!this.raycaster || !this.camera || !this.renderer) return;
+
+  const rect = this.renderer.domElement.getBoundingClientRect();
+  const x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  const y = -(((event.clientY - rect.top) / rect.height) * 2 - 1);
+  this.pointer.set(x, y);
+  this.raycaster.setFromCamera(this.pointer, this.camera);
+
+  // ✨ 先拾取标签（渲染在最上层，优先级更高）
+  if (this.labelSprites && this.labelSprites.length > 0) {
+    const labelHits = this.raycaster.intersectObjects(
+      this.labelSprites,
+      false,
+    );
+    if (labelHits.length > 0) {
+      const sp = labelHits[0].object;
+      const name = sp.userData && sp.userData.riverName;
+      if (name) {
+        // 找到同名 mesh，复用同一选中逻辑
+        const mesh = this.riverMeshes.find(
+          (m) => m.userData && m.userData.riverName === name,
+        );
+        if (mesh) {
+          this.selectRiverByMesh(mesh);
+          return;
+        } else {
+          // 兜底：只更新面板显示
+          this.selectedRiverName = name;
+          this.selectedRiverMat = null;
+          return;
+        }
+      }
+    }
+  }
+
+  // 再拾取河流 tube
+  if (!this.riverMeshes || this.riverMeshes.length === 0) {
+    this.clearRiverSelection();
+    return;
+  }
+  const intersects = this.raycaster.intersectObjects(
+    this.riverMeshes,
+    false,
+  );
+  if (!intersects || intersects.length === 0) {
+    this.clearRiverSelection();
+    return;
+  }
+
+  const mesh = intersects[0].object;
+  if (!mesh || !mesh.userData || !mesh.userData.riverName) return;
+  this.selectRiverByMesh(mesh);
+},
     clearRiverSelection() {
-      // 恢复所有河流颜色
       for (const mesh of this.riverMeshes) {
         const base = this._riverBaseColorMap.get(mesh.uuid);
         if (
@@ -528,7 +733,6 @@ export default {
       )
         return;
 
-      // 先清空旧选中
       for (const m of this.riverMeshes) {
         const base = this._riverBaseColorMap.get(m.uuid);
         if (
@@ -541,7 +745,6 @@ export default {
         }
       }
 
-      // 设置新选中态：改变颜色 + 让 animate 中更快流动
       if (
         mesh.material &&
         mesh.material.uniforms &&
@@ -569,8 +772,8 @@ export default {
         const allSegmentPoints = [];
         const radius =
           name === "淮河" || name === "长江"
-            ? this.config.riverBaseWidth * 7 // 主干更粗
-            : this.config.riverBaseWidth * 1.8; // 支流更细，形成明显层次
+            ? this.config.riverBaseWidth * 7
+            : this.config.riverBaseWidth * 1.8;
 
         lines.forEach((line) => {
           const pts = line
@@ -584,7 +787,7 @@ export default {
               if (u < 0 || u > 1 || v < 0 || v > 1) return null;
               return new THREE.Vector3(
                 (u - 0.5) * this.config.width,
-                this.getH(u, v, demMax) + 30, // 抬高从 60 降到 30，边界更贴地形
+                this.getH(u, v, demMax) + 30,
                 -(v - 0.5) * this.config.height,
               );
             })
@@ -603,80 +806,103 @@ export default {
 
           const baseColor =
             name === "淮河" || name === "长江"
-              ? new THREE.Color(0x1a5fa8) // 主河流：更深的钢蓝
-              : new THREE.Color(0x3a85c8); // 支流：中蓝
+              ? new THREE.Color(0x1a5fa8)
+              : new THREE.Color(0x3a85c8);
 
           const mat = new THREE.ShaderMaterial({
             uniforms: {
               uTime: { value: 0 },
               uColor: { value: baseColor.clone() },
-              uBaseColor: { value: new THREE.Color(0x2889dd) }, // 河床：主蓝
-              uFlowColor: { value: new THREE.Color(0xbfe6ff) }, // 流动尾部：浅蓝
-              uHeadColor: { value: new THREE.Color(0x63c2fe) }, // 头部：青白发光
+              uBaseColor: { value: new THREE.Color(0x2889dd) },
+              uFlowColor: { value: new THREE.Color(0xbfe6ff) },
+              uHeadColor: { value: new THREE.Color(0x63c2fe) },
+              // ✨ 新增：区域高亮相关
+              uAnhuiMask: { value: this.topMat.uniforms.uAnhuiMask.value },
+              uHuaiheMask: { value: this.topMat.uniforms.uHuaiheMask.value },
+              uActiveRegion: {
+                value: this.topMat.uniforms.uActiveRegion.value,
+              },
+              uMapBounds: {
+                value: new THREE.Vector4(
+                  -this.config.width / 2,
+                  this.config.width / 2,
+                  -this.config.height / 2,
+                  this.config.height / 2,
+                ),
+              },
             },
             vertexShader: `
-    varying vec2 vUv;
-    void main(){
-      vUv = uv;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    }
-  `,
+              varying vec2 vUv;
+              varying vec3 vWorldPos;
+              void main(){
+                vUv = uv;
+                vec4 wp = modelMatrix * vec4(position, 1.0);
+                vWorldPos = wp.xyz;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+              }
+            `,
             fragmentShader: `
-    uniform float uTime;
-    uniform vec3 uBaseColor;
-    uniform vec3 uFlowColor;
-    uniform vec3 uHeadColor;
-    varying vec2 vUv;
+              uniform float uTime;
+              uniform vec3 uBaseColor;
+              uniform vec3 uFlowColor;
+              uniform vec3 uHeadColor;
+              uniform sampler2D uAnhuiMask;
+              uniform sampler2D uHuaiheMask;
+              uniform int uActiveRegion;
+              uniform vec4 uMapBounds;
+              varying vec2 vUv;
+              varying vec3 vWorldPos;
 
-    void main(){
-      // ============ 河床基础 ============
-      vec3 baseColor = uBaseColor;
-      float baseAlpha = 0.92;
+              void main(){
+                vec3 baseColor = uBaseColor;
+                float baseAlpha = 0.92;
 
-      // ============ 流光带 ============
-      float f = fract(vUv.x * 1.0 - uTime * 0.4);
+                float f = fract(vUv.x * 1.0 - uTime * 0.4);
+                float bandStart = 0.35;
+                float bandEnd = 1.0;
+                float bandMask = smoothstep(bandStart, bandStart + 0.05, f)
+                               * smoothstep(bandEnd, bandEnd - 0.02, f);
+                float localT = clamp((f - bandStart) / (bandEnd - bandStart), 0.0, 1.0);
+                float colorT = pow(localT, 1.3);
+                vec3 flowColor = mix(uFlowColor, uHeadColor, colorT);
+                float flowAlpha = pow(localT, 2.0);
+                float headBoost = smoothstep(0.8, 1.0, localT);
+                flowColor += uHeadColor * headBoost * 0.6;
+                flowAlpha = min(flowAlpha + headBoost * 0.3, 1.0);
 
-      float bandStart = 0.35;
-      float bandEnd = 1.0;
+                float flowIntensity = bandMask * flowAlpha;
+                vec3 finalColor = mix(baseColor, flowColor, flowIntensity);
+                float finalAlpha = baseAlpha + flowIntensity * 0.08;
+                finalAlpha = clamp(finalAlpha, 0.0, 1.0);
 
-      float bandMask = smoothstep(bandStart, bandStart + 0.05, f)
-                     * smoothstep(bandEnd, bandEnd - 0.02, f);
+                // ✨ 区域高亮控制
+                float maskU = (vWorldPos.x - uMapBounds.x) / (uMapBounds.y - uMapBounds.x);
+                float maskV = 1.0 - (vWorldPos.z - uMapBounds.z) / (uMapBounds.w - uMapBounds.z);
+                vec2 maskUV = vec2(maskU, maskV);
+                float inAnhui  = smoothstep(0.35, 0.65, texture2D(uAnhuiMask, maskUV).r);
+                float inHuaihe = smoothstep(0.35, 0.65, texture2D(uHuaiheMask, maskUV).r);
 
-      float localT = clamp((f - bandStart) / (bandEnd - bandStart), 0.0, 1.0);
+                float inRegion = 1.0;
+                if (uActiveRegion == 0) {
+                  inRegion = inAnhui;
+                } else if (uActiveRegion == 1) {
+                  inRegion = inHuaihe;
+                }
 
-      // ============ 头尾颜色渐变（浅蓝 → 青白头部）============
-      float colorT = pow(localT, 1.3);
-      vec3 flowColor = mix(uFlowColor, uHeadColor, colorT);
+                float brightness = mix(0.35, 1.0, inRegion);
+                float alphaFactor = mix(0.25, 1.0, inRegion);
 
-      // ============ 透明度渐变（尾部完全消失）============
-      float flowAlpha = pow(localT, 2.0);
-
-      // ============ 头部聚焦增亮（水头冲锋 + 发光）============
-      float headBoost = smoothstep(0.8, 1.0, localT);
-      flowColor += uHeadColor * headBoost * 0.6;
-      flowAlpha = min(flowAlpha + headBoost * 0.3, 1.0);
-
-      // ============ 混合河床 + 流光 ============
-      float flowIntensity = bandMask * flowAlpha;
-
-      vec3 finalColor = mix(baseColor, flowColor, flowIntensity);
-      float finalAlpha = baseAlpha + flowIntensity * 0.08;   // 河床已经很不透明，流光只加一点点
-      finalAlpha = clamp(finalAlpha, 0.0, 1.0);
-
-      gl_FragColor = vec4(finalColor, finalAlpha);
-    }
-  `,
+                gl_FragColor = vec4(finalColor * brightness, finalAlpha * alphaFactor);
+              }
+            `,
             transparent: true,
             blending: THREE.NormalBlending,
             depthWrite: false,
           });
           this.riverMaterials.push(mat);
 
-          // 关键：保存 mesh，给拾取用 + 记录河流名
           const mesh = new THREE.Mesh(tubeGeom, mat);
-          mesh.userData = {
-            riverName: name,
-          };
+          mesh.userData = { riverName: name };
           this.riverMeshes.push(mesh);
           this._riverBaseColorMap.set(mesh.uuid, baseColor.clone());
 
@@ -724,63 +950,63 @@ export default {
       return longest[Math.floor(longest.length / 2)];
     },
 
-    createRiverLabel(text, position, type) {
-      const cfg = this.labelConfig;
-      const canvas = document.createElement("canvas");
-      const ctx = canvas.getContext("2d");
-      ctx.font = `bold ${cfg.fontSize}px "Microsoft YaHei", sans-serif`;
-      const tw = ctx.measureText(text).width;
-      const th = cfg.fontSize * 1.4;
-      canvas.width = tw + cfg.padding * 2;
-      canvas.height = th + cfg.padding * 2;
-      ctx.font = `bold ${cfg.fontSize}px "Microsoft YaHei", sans-serif`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
+ createRiverLabel(text, position, type) {
+  const cfg = this.labelConfig;
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  ctx.font = `bold ${cfg.fontSize}px "Microsoft YaHei", sans-serif`;
+  const tw = ctx.measureText(text).width;
+  const th = cfg.fontSize * 1.4;
+  canvas.width = tw + cfg.padding * 2;
+  canvas.height = th + cfg.padding * 2;
+  ctx.font = `bold ${cfg.fontSize}px "Microsoft YaHei", sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
 
-      // 淡淡的白色圆角背景，几乎透明
-      ctx.fillStyle = cfg.bgColor;
-      ctx.beginPath();
-      ctx.roundRect(0, 0, canvas.width, canvas.height, 6);
-      ctx.fill();
+  ctx.fillStyle = cfg.bgColor;
+  ctx.beginPath();
+  ctx.roundRect(0, 0, canvas.width, canvas.height, 6);
+  ctx.fill();
 
-      // 去掉边框（不再需要）
+  ctx.shadowColor = "rgba(255, 255, 255, 0.9)";
+  ctx.shadowBlur = 8;
+  ctx.shadowOffsetX = 0;
+  ctx.shadowOffsetY = 0;
 
-      // 文字阴影（增加可读性和层次）
-      ctx.shadowColor = "rgba(255, 255, 255, 0.9)";
-      ctx.shadowBlur = 8;
-      ctx.shadowOffsetX = 0;
-      ctx.shadowOffsetY = 0;
+  ctx.lineJoin = "round";
+  ctx.lineWidth = cfg.strokeWidth;
+  ctx.strokeStyle = cfg.strokeColor;
+  ctx.strokeText(text, canvas.width / 2, canvas.height / 2);
 
-      // 白色描边（外描边，让文字在任何背景上都清晰）
-      ctx.lineJoin = "round";
-      ctx.lineWidth = cfg.strokeWidth;
-      ctx.strokeStyle = cfg.strokeColor;
-      ctx.strokeText(text, canvas.width / 2, canvas.height / 2);
+  ctx.shadowColor = "transparent";
+  ctx.shadowBlur = 0;
 
-      // 关闭阴影，再填深色文字
-      ctx.shadowColor = "transparent";
-      ctx.shadowBlur = 0;
+  ctx.fillStyle = type == "rivers" ? cfg.color : cfg.color2;
+  ctx.fillText(text, canvas.width / 2, canvas.height / 2);
 
-      ctx.fillStyle = type == "rivers" ? cfg.color : cfg.color2;
-      ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+  const spriteMat = new THREE.SpriteMaterial({
+    map: new THREE.CanvasTexture(canvas),
+    transparent: true,
+    toneMapped: false,
+    depthTest: false,
+  });
+  const sprite = new THREE.Sprite(spriteMat);
+  const aspect = canvas.width / canvas.height;
+  sprite.scale.set(cfg.scale * aspect * 100, cfg.scale * 100, 1);
 
-      const spriteMat = new THREE.SpriteMaterial({
-        map: new THREE.CanvasTexture(canvas),
-        transparent: true,
-        toneMapped: false,
-        depthTest: false,
-      });
-      const sprite = new THREE.Sprite(spriteMat);
-      const aspect = canvas.width / canvas.height;
-      sprite.scale.set(cfg.scale * aspect * 100, cfg.scale * 100, 1);
+  sprite.position.copy(position);
+  sprite.position.y += cfg.heightOffset;
+  sprite.renderOrder = 999;
 
-      sprite.position.copy(position);
-      sprite.position.y += cfg.heightOffset;
-      sprite.renderOrder = 999;
+  // ✨ 新增：给标签打上河流名，用于点击拾取
+  sprite.userData = {
+    riverName: text,
+    type: type,
+  };
 
-      this.mapGroup.add(sprite);
-      this.labelSprites.push(sprite);
-    },
+  this.mapGroup.add(sprite);
+  this.labelSprites.push(sprite);
+},
 
     createGoldenBorder(coords, demMax) {
       const points = coords.map((c) => {
@@ -807,29 +1033,24 @@ export default {
       this.borderMat = new THREE.ShaderMaterial({
         uniforms: { uTime: { value: 0 } },
         vertexShader: `
-    varying vec2 vUv;
-    void main(){
-      vUv = uv;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    }
-  `,
+          varying vec2 vUv;
+          void main(){
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
         fragmentShader: `
-    uniform float uTime;
-    varying vec2 vUv;
-    void main(){
-      // 浅青色 #22D3EE 作为主色，两端有轻微流光
-      vec3 baseColor = vec3(0.13, 0.83, 0.93);    // #22D3EE
-      vec3 sparkColor = vec3(0.75, 0.98, 1.0);    // 更亮的青白
-
-      // 缓慢流光
-      float flow = fract(vUv.x * 3.0 - uTime * 0.3);
-      float spark = pow(smoothstep(0.75, 1.0, flow), 3.0);
-
-      vec3 color = mix(baseColor, sparkColor, spark * 0.5);
-
-      gl_FragColor = vec4(color, 1.0);
-    }
-  `,
+          uniform float uTime;
+          varying vec2 vUv;
+          void main(){
+            vec3 baseColor = vec3(0.13, 0.83, 0.93);
+            vec3 sparkColor = vec3(0.75, 0.98, 1.0);
+            float flow = fract(vUv.x * 3.0 - uTime * 0.3);
+            float spark = pow(smoothstep(0.75, 1.0, flow), 3.0);
+            vec3 color = mix(baseColor, sparkColor, spark * 0.5);
+            gl_FragColor = vec4(color, 1.0);
+          }
+        `,
       });
       this.mapGroup.add(new THREE.Mesh(tubeGeom, this.borderMat));
     },
@@ -901,30 +1122,25 @@ export default {
               uMaxH: { value: this.config.maxH },
             },
             vertexShader: `
-        varying float vY;
-        void main(){
-          vY = position.y;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
+              varying float vY;
+              void main(){
+                vY = position.y;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+              }
+            `,
             fragmentShader: `
-        uniform float uBaseY;
-        uniform float uMaxH;
-        varying float vY;
-        void main(){
-          float f = (vY - uBaseY) / (uMaxH - uBaseY);
-
-          // 深蓝 → 纯黑 渐变（顶部深蓝，底部融入背景）
-          vec3 topColor = vec3(0.12, 0.22, 0.52);    // #1E3A8A 深蓝
-          vec3 bottomColor = vec3(0.02, 0.03, 0.08); // 近黑
-
-          // 使用平滑曲线，让底部更快融入黑色
-          float t = pow(f, 0.7);
-          vec3 color = mix(bottomColor, topColor, t);
-
-          gl_FragColor = vec4(color, 1.0);
-        }
-      `,
+              uniform float uBaseY;
+              uniform float uMaxH;
+              varying float vY;
+              void main(){
+                float f = (vY - uBaseY) / (uMaxH - uBaseY);
+                vec3 topColor = vec3(0.12, 0.22, 0.52);
+                vec3 bottomColor = vec3(0.02, 0.03, 0.08);
+                float t = pow(f, 0.7);
+                vec3 color = mix(bottomColor, topColor, t);
+                gl_FragColor = vec4(color, 1.0);
+              }
+            `,
             side: THREE.DoubleSide,
           }),
         ),
@@ -942,263 +1158,22 @@ export default {
       ).filter((c) => c && !isNaN(c[0]));
     },
 
-    createLakes(lakeJson, demMax) {
-      const labeledLakes = new Set();
-
-      this.lakeMaterial = new THREE.ShaderMaterial({
-        uniforms: {
-          uTime: { value: 0 },
-          uDeepColor: { value: new THREE.Color(0x0d4080) },
-          uShallowColor: { value: new THREE.Color(0x4ab8ff) },
-          uHighlight: { value: new THREE.Color(0x9fe8ff) },
-          uEdgeColor: { value: new THREE.Color(0xb0f0ff) },
-          uCameraPos: { value: new THREE.Vector3() },
-        },
-        vertexShader: `
-      attribute float aEdgeDist;
-      varying vec2 vUv;
-      varying vec3 vWorldPos;
-      varying vec3 vNormal;
-      varying float vEdgeDist;
-      void main() {
-        vUv = uv;
-        vEdgeDist = aEdgeDist;
-        vec4 wp = modelMatrix * vec4(position, 1.0);
-        vWorldPos = wp.xyz;
-        vNormal = normalize(normalMatrix * normal);
-        gl_Position = projectionMatrix * viewMatrix * wp;
-      }
-    `,
-        fragmentShader: `
-      uniform float uTime;
-      uniform vec3 uDeepColor, uShallowColor, uHighlight, uEdgeColor, uCameraPos;
-      varying vec2 vUv;
-      varying vec3 vWorldPos;
-      varying vec3 vNormal;
-      varying float vEdgeDist;
-
-      vec2 hash2(vec2 p){
-        p = vec2(dot(p,vec2(127.1,311.7)), dot(p,vec2(269.5,183.3)));
-        return -1.0 + 2.0*fract(sin(p)*43758.5453123);
-      }
-      float gnoise(vec2 p){
-        vec2 i = floor(p), f = fract(p);
-        vec2 u = f*f*(3.0-2.0*f);
-        return mix(mix(dot(hash2(i), f),
-                       dot(hash2(i+vec2(1,0)), f-vec2(1,0)), u.x),
-                   mix(dot(hash2(i+vec2(0,1)), f-vec2(0,1)),
-                       dot(hash2(i+vec2(1,1)), f-vec2(1,1)), u.x), u.y);
-      }
-      float fbm(vec2 p){
-        float v = 0.0, a = 0.5;
-        for(int i = 0; i < 5; i++){ v += a*gnoise(p); p *= 2.0; a *= 0.5; }
-        return v;
-      }
-
-      void main() {
-        vec2 flow1 = vUv * 12.0 + vec2(uTime * 0.05, uTime * 0.03);
-        vec2 flow2 = vUv * 25.0 - vec2(uTime * 0.04, uTime * 0.06);
-        float w1 = fbm(flow1);
-        float w2 = fbm(flow2);
-        float waves = w1 * 0.6 + w2 * 0.4;
-
-        vec3 col = mix(uDeepColor, uShallowColor, smoothstep(-0.3, 0.5, waves));
-        col *= 1.25;
-
-        float d = distance(vUv, vec2(0.5));
-        float ripple = sin(d * 80.0 - uTime * 2.5) * 0.5 + 0.5;
-        ripple *= smoothstep(0.5, 0.0, d);
-        col += uHighlight * ripple * 0.04;
-
-        vec3 viewDir = normalize(uCameraPos - vWorldPos);
-        float fres = pow(1.0 - max(dot(vNormal, viewDir), 0.0), 3.0);
-        col += uHighlight * fres * 0.25;
-
-        float sparkle = smoothstep(0.7, 0.82, w2) * smoothstep(0.65, 0.88, w1);
-        col += uHighlight * sparkle * 0.6;
-
-        float band = sin(vUv.y * 60.0 + waves * 4.0 + uTime * 0.6);
-        band = smoothstep(0.9, 1.0, band);
-        col += uHighlight * band * 0.1;
-
-        float edgeGlow = 1.0 - smoothstep(0.0, 0.06, vEdgeDist);
-        float edgePulse = 0.7 + 0.3 * sin(uTime * 2.0);
-        col += uEdgeColor * edgeGlow * edgePulse * 1.1;
-
-        float innerRing = smoothstep(0.05, 0.1, vEdgeDist) - smoothstep(0.1, 0.16, vEdgeDist);
-        col += uEdgeColor * innerRing * 0.3;
-
-        col = min(col, vec3(1.0, 1.1, 1.2));
-
-        gl_FragColor = vec4(col, 0.95);
-      }
-    `,
-        transparent: true,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-        blending: THREE.NormalBlending,
-      });
-
-      lakeJson.features.forEach((feature) => {
-        const name =
-          feature.properties.motorboat || feature.properties.NAME || "湖泊";
-        const polygons =
-          feature.geometry.type === "Polygon"
-            ? [feature.geometry.coordinates]
-            : feature.geometry.coordinates;
-
-        polygons.forEach((polygon) => {
-          const ring = polygon[0];
-          if (!ring || ring.length < 3) return;
-
-          const shape = new THREE.Shape();
-          const ptsXZ = [];
-          const ringHeights = [];
-
-          ring.forEach((coord, i) => {
-            const u =
-              (coord[0] - this.bounds.minLon) /
-              (this.bounds.maxLon - this.bounds.minLon);
-            const v =
-              (coord[1] - this.bounds.minLat) /
-              (this.bounds.maxLat - this.bounds.minLat);
-            const x = (u - 0.5) * this.config.width;
-            const z = -(v - 0.5) * this.config.height;
-            if (i === 0) shape.moveTo(x, z);
-            else shape.lineTo(x, z);
-            ptsXZ.push({ x, z });
-            ringHeights.push(this.getOriginalH(u, v, demMax));
-          });
-
-          const avgShoreH =
-            ringHeights.reduce((a, b) => a + b, 0) / ringHeights.length;
-          const waterLevel = avgShoreH - 80;
-
-          const buildGeom = () => {
-            const g = new THREE.ShapeGeometry(shape, 32);
-            g.computeBoundingBox();
-            const { min, max } = g.boundingBox;
-            const sx = max.x - min.x,
-              sy = max.y - min.y;
-            const uvAttr = g.attributes.uv;
-            const posAttr = g.attributes.position;
-
-            const edgeDist = new Float32Array(posAttr.count);
-            let maxDist = 0;
-            for (let i = 0; i < posAttr.count; i++) {
-              const px = posAttr.getX(i);
-              const py = posAttr.getY(i);
-              let minD = Infinity;
-              for (let j = 0; j < ptsXZ.length; j++) {
-                const dx = px - ptsXZ[j].x;
-                const dz = py - ptsXZ[j].z;
-                const dd = dx * dx + dz * dz;
-                if (dd < minD) minD = dd;
-              }
-              minD = Math.sqrt(minD);
-              edgeDist[i] = minD;
-              if (minD > maxDist) maxDist = minD;
-            }
-            for (let i = 0; i < edgeDist.length; i++) {
-              edgeDist[i] = maxDist > 0 ? edgeDist[i] / maxDist : 0;
-            }
-            g.setAttribute("aEdgeDist", new THREE.BufferAttribute(edgeDist, 1));
-
-            for (let i = 0; i < uvAttr.count; i++) {
-              const px = posAttr.getX(i);
-              const py = posAttr.getY(i);
-              uvAttr.setXY(i, (px - min.x) / sx, (py - min.y) / sy);
-            }
-            return g;
-          };
-
-          const waterMesh = new THREE.Mesh(buildGeom(), this.lakeMaterial);
-          waterMesh.rotateX(Math.PI / 2);
-          waterMesh.position.y = waterLevel;
-          waterMesh.renderOrder = 10;
-          this.mapGroup.add(waterMesh);
-
-          // ✨ 贴地发光边界（每段细分 8 次，确保严丝合缝贴地）
-          const denseEdgePts = [];
-          for (let i = 0; i < ring.length; i++) {
-            const c0 = ring[i];
-            const c1 = ring[(i + 1) % ring.length];
-            const SUB = 8;
-            for (let s = 0; s < SUB; s++) {
-              const t = s / SUB;
-              const lon = c0[0] + (c1[0] - c0[0]) * t;
-              const lat = c0[1] + (c1[1] - c0[1]) * t;
-              const u =
-                (lon - this.bounds.minLon) /
-                (this.bounds.maxLon - this.bounds.minLon);
-              const v =
-                (lat - this.bounds.minLat) /
-                (this.bounds.maxLat - this.bounds.minLat);
-              const x = (u - 0.5) * this.config.width;
-              const z = -(v - 0.5) * this.config.height;
-              // 用 getH（含凹陷）取真实当前地形高度
-              const y = this.getH(u, v, demMax) + 8;
-              denseEdgePts.push(new THREE.Vector3(x, y, z));
-            }
-          }
-
-          if (denseEdgePts.length > 2) {
-            const curve = new THREE.CatmullRomCurve3(denseEdgePts, true);
-            const edgeGeom = new THREE.TubeGeometry(
-              curve,
-              denseEdgePts.length * 2,
-              6,
-              8,
-              true,
-            );
-            const edgeMat = new THREE.MeshBasicMaterial({
-              color: 0x88e8ff,
-              transparent: true,
-              opacity: 0.95,
-              depthWrite: false,
-              blending: THREE.AdditiveBlending,
-            });
-            const edge = new THREE.Mesh(edgeGeom, edgeMat);
-            edge.renderOrder = 11;
-            //this.mapGroup.add(edge)
-          }
-
-          // 质心 + 标签
-          let area = 0,
-            cx = 0,
-            cz = 0;
-          for (let i = 0; i < ptsXZ.length; i++) {
-            const p0 = ptsXZ[i],
-              p1 = ptsXZ[(i + 1) % ptsXZ.length];
-            const f = p0.x * p1.z - p1.x * p0.z;
-            area += f;
-            cx += (p0.x + p1.x) * f;
-            cz += (p0.z + p1.z) * f;
-          }
-          area *= 0.5;
-          const centroidX = cx / (6 * area);
-          const centroidZ = cz / (6 * area);
-
-          if (name && name !== "湖泊" && !labeledLakes.has(name)) {
-            this.createRiverLabel(
-              name,
-              new THREE.Vector3(centroidX, avgShoreH + 100, centroidZ),
-              "lakers",
-            );
-            labeledLakes.add(name);
-          }
-        });
-      });
-    },
-
     animate() {
       requestAnimationFrame(() => this.animate());
 
-      if (this.controls && !this.isTransitioning) {
+      // ✨ 摄像机动画更新
+      this.updateCameraAnimation();
+
+      if (this.controls && !this.isTransitioning && !this.cameraAnim.active) {
         this.controls.update();
       }
 
-      if (this.camera && this.controls && !this.isTransitioning) {
+      if (
+        this.camera &&
+        this.controls &&
+        !this.isTransitioning &&
+        !this.cameraAnim.active
+      ) {
         const dist = this.camera.position.distanceTo(this.controls.target);
 
         if (dist < 5000) {
@@ -1223,7 +1198,6 @@ export default {
         this.lakeMaterial.uniforms.uCameraPos.value.copy(this.camera.position);
       }
 
-      // ===== 河流动画：选中态加速流光 =====
       this.riverMaterials.forEach((m) => {
         const speed = this.selectedRiverMat === m ? 0.04 : 0.018;
         m.uniforms.uTime.value += speed;
@@ -1249,7 +1223,7 @@ export default {
       });
       this.composer.render();
     },
-    // 确保此函数在 methods 的第一层
+
     threePosToLonLat(pos) {
       if (!pos || !this.config || !this.bounds) return [117.2, 31.8];
       const u = pos.x / this.config.width + 0.5;
@@ -1275,13 +1249,9 @@ export default {
       );
     },
 
-    // 从 2D 回退到 3D 的处理
     syncViewFrom2D(lonLat) {
-      // ✨ 完全重置为初始视角，不再使用 2D 传回的 lonLat
-      this.camera.position.set(0, 28000, 28000);
-      this.controls.target.set(0, 0, 0); // 目标点重置到地图中心
-      this.camera.up.set(0, 1, 0); // 相机 up 向量重置
-      this.controls.update();
+      // 回退到当前选中区域视角
+      this.switchRegion(this.currentRegion, false);
 
       setTimeout(() => {
         this.isTransitioning = false;
@@ -1290,6 +1260,7 @@ export default {
         }
       }, 300);
     },
+
     onResize() {
       const container = this.$refs.container;
       if (!container) return;
@@ -1301,12 +1272,9 @@ export default {
       this.composer.setSize(w, h);
     },
 
-    // 1. 发送同步指令给 Iframe
     handleTransitionTrigger() {
       const targetLonLat = this.threePosToLonLat(this.controls.target);
-      this.isTransitioned = true; // 触发 CSS 过渡效果
-
-      // 向 Iframe 发送坐标和缩放等级
+      this.isTransitioned = true;
       const iframeWin = this.$refs.mapIframe.contentWindow;
       iframeWin.postMessage(
         {
@@ -1315,17 +1283,16 @@ export default {
           zoom: 14,
         },
         "http://localhost:5174",
-      ); // 明确指定接收方域名，提高安全性
+      );
     },
 
-    // 2. 接收来自 Iframe 的“拉回 3D” 指令
     handleIframeMessage(event) {
       if (event.origin !== "http://localhost:5173") return;
 
       if (event.data.type === "BACK_TO_3D") {
-        this.isTransitioned = false; // 切回 3D
+        this.isTransitioned = false;
         const lonLat = event.data.lonLat;
-        this.syncViewFrom2D(lonLat); // 执行相机从地面拉升的动画
+        this.syncViewFrom2D(lonLat);
       }
     },
   },
@@ -1370,6 +1337,41 @@ export default {
   transform: translate(-50%, -50%);
   color: #00ffff;
   z-index: 100;
+}
+
+/* ✨ 新增：区域切换按钮（沿用项目1的浅色主题） */
+.region-switcher {
+  position: absolute;
+  top: 100px;
+  left: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  z-index: 50;
+}
+.region-switcher button {
+  padding: 10px 24px;
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid rgba(36, 120, 212, 0.45);
+  color: #1a5490;
+  border-radius: 8px;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  font-size: 14px;
+  font-weight: 600;
+  transition: all 0.25s;
+  box-shadow: 0 2px 12px rgba(36, 120, 212, 0.1);
+}
+.region-switcher button:hover {
+  background: rgba(255, 255, 255, 0.95);
+  transform: translateX(4px);
+  box-shadow: 0 4px 16px rgba(36, 120, 212, 0.25);
+}
+.region-switcher button.active {
+  background: linear-gradient(135deg, #2478d4, #22d3ee);
+  color: #fff;
+  border-color: #22d3ee;
+  box-shadow: 0 0 20px rgba(34, 211, 238, 0.6);
 }
 
 /* ===== 河流点击交互面板 ===== */
